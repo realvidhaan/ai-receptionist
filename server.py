@@ -6,7 +6,7 @@ Voice receptionist server (Gemini Live + multi-tool, real Google backend).
   POST /tool    -> {tool, args} -> real Google Calendar/Sheets via google_backend
 Run:  python3 server.py   then open  http://localhost:<PORT>
 """
-import json, ssl, urllib.request, urllib.error, datetime, http.server, socketserver, os
+import json, re, ssl, urllib.request, urllib.error, urllib.parse, datetime, http.server, socketserver, os
 from zoneinfo import ZoneInfo
 import certifi
 import config
@@ -14,7 +14,51 @@ import google_backend as gb
 
 CTX = ssl.create_default_context(cafile=certifi.where())
 HERE = os.path.dirname(os.path.abspath(__file__))
-GEMINI_KEY, MODEL, VOICE, PORT, COMPANY = config.GEMINI_KEY, config.MODEL, config.VOICE, config.PORT, config.COMPANY
+GEMINI_KEY, MODEL, VOICE, PORT = config.GEMINI_KEY, config.MODEL, config.VOICE, config.PORT
+OWNER_EMAIL, PROVISION_SECRET, PUBLIC_BASE = config.OWNER_EMAIL, config.PROVISION_SECRET, config.PUBLIC_BASE
+TENANTS_PATH = os.path.join(HERE, "tenants.json")
+
+# ---- tenant registry: one company per slug, each with its own Sheet + Calendar ----
+def _slug(s):
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", (s or "").lower())).strip("-") or "company"
+
+def save_tenants(t):
+    with open(TENANTS_PATH, "w", encoding="utf-8") as f:
+        json.dump(t, f, indent=2)
+
+def load_tenants():
+    if os.path.exists(TENANTS_PATH):
+        with open(TENANTS_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    # first run: migrate the single .env company as the default tenant so nothing breaks
+    c = dict(config.COMPANY)
+    t = {_slug(c["business"]): {"company": c, "sheet_id": config.SHEET_ID, "calendar_id": config.CALENDAR_ID}}
+    save_tenants(t)
+    return t
+
+TENANTS = load_tenants()
+DEFAULT_TENANT = _slug(config.COMPANY["business"])
+
+def get_tenant(cid):
+    """Resolve a slug to (slug, tenant); fall back to the default/first company if unknown."""
+    if cid and cid in TENANTS:
+        return cid, TENANTS[cid]
+    if DEFAULT_TENANT in TENANTS:
+        return DEFAULT_TENANT, TENANTS[DEFAULT_TENANT]
+    first = next(iter(TENANTS))
+    return first, TENANTS[first]
+
+def _base_company(business, city):
+    """Neutral, owner-reviewable defaults for a new HVAC company (no other company's specifics)."""
+    return {
+        "business": business, "city": city, "tz": config.TZ,
+        "service_area": city or "the local area",
+        "hours": "Monday to Saturday, 8am to 6pm",
+        "services": "heating and cooling repair, installation, and maintenance",
+        "emergency": "Call us for urgent no-heat or no-cooling situations",
+        "features": "licensed and insured, free estimates, upfront quotes",
+        "default_duration_min": 60, "open_hour": 8, "close_hour": 18,
+    }
 
 # ---- the tool suite (single source of truth: token constraint + page + relay) ----
 TOOLS = [{"functionDeclarations": [
@@ -62,7 +106,7 @@ TOOLS = [{"functionDeclarations": [
 ]}]
 
 # ---- grounding: research the real company once via Gemini google_search ----
-_WEB_FACTS = None
+_WEB_FACTS = {}
 def _gemini_search(prompt):
     body = {"contents": [{"parts": [{"text": prompt}]}], "tools": [{"google_search": {}}]}
     req = urllib.request.Request(
@@ -73,20 +117,40 @@ def _gemini_search(prompt):
     return "".join(p.get("text", "") for p in parts).strip()
 
 def get_web_facts(c):
-    """Cached: real public info about the EXACT company, or '' if not confidently found (avoids misattribution)."""
-    global _WEB_FACTS
-    if _WEB_FACTS is not None:
-        return _WEB_FACTS
+    """Cached per company: real public info about the EXACT company, or '' if not confidently found."""
+    key = c.get("business", "")
+    if key in _WEB_FACTS:
+        return _WEB_FACTS[key]
     try:
         txt = _gemini_search(
-            f"Search the web for the HVAC company named exactly '{c['business']}' in {c['city']}. "
+            f"Search the web for the HVAC company named exactly '{key}' in {c.get('city','')}. "
             "ONLY if you can confirm that exact company exists, reply with a single short factual paragraph covering its "
             "address, hours, phone, services, emergency service, and notable features. "
             "If you cannot find that exact company, reply with exactly: NONE")
-        _WEB_FACTS = "" if (not txt or txt.strip().upper().startswith("NONE") or len(txt) < 25) else txt[:600]
+        _WEB_FACTS[key] = "" if (not txt or txt.strip().upper().startswith("NONE") or len(txt) < 25) else txt[:600]
     except Exception as e:
-        print("  (grounding search skipped:", str(e)[:100], ")"); _WEB_FACTS = ""
-    return _WEB_FACTS
+        print("  (grounding search skipped:", str(e)[:100], ")"); _WEB_FACTS[key] = ""
+    return _WEB_FACTS[key]
+
+def scrape_profile(business, city, website="", phone=""):
+    """Build a company profile from the web via Gemini google_search. Verified fields overwrite the neutral
+    defaults; anything it can't confirm is left at the owner-reviewable default (no invented specifics)."""
+    c = _base_company(business, city)
+    prompt = (f"Research the HVAC company '{business}'"
+              + (f" in {city}" if city else "")
+              + (f", website {website}" if website else "")
+              + ". Return ONLY a JSON object with keys: city, service_area, hours, services, emergency, features. "
+              "Each value is a short factual string you can verify about THIS specific company. "
+              "If you cannot verify a field, use an empty string. Output only the JSON, no prose.")
+    try:
+        m = re.search(r"\{.*\}", _gemini_search(prompt), re.S)
+        prof = json.loads(m.group(0)) if m else {}
+    except Exception as e:
+        print("  (profile scrape failed:", str(e)[:100], ")"); prof = {}
+    for k in ("city", "service_area", "hours", "services", "emergency", "features"):
+        if isinstance(prof.get(k), str) and prof[k].strip():
+            c[k] = prof[k].strip()
+    return c
 
 def verified_facts(c):
     lines = [
@@ -149,7 +213,7 @@ def persona(c):
     )
 
 # ---- token + page ----
-def mint_token():
+def mint_token(company):
     now = datetime.datetime.now(datetime.UTC)
     body = json.dumps({
         "uses": 1,
@@ -159,7 +223,7 @@ def mint_token():
             "model": MODEL,
             "generationConfig": {"responseModalities": ["AUDIO"], "thinkingConfig": {"thinkingBudget": 0},
                                  "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": VOICE}}}},
-            "systemInstruction": {"parts": [{"text": persona(COMPANY)}], "role": "user"},
+            "systemInstruction": {"parts": [{"text": persona(company)}], "role": "user"},
             "tools": TOOLS,
         },
     }).encode()
@@ -168,11 +232,12 @@ def mint_token():
         data=body, headers={"Content-Type": "application/json"}, method="POST")
     return json.load(urllib.request.urlopen(req, timeout=30, context=CTX))["name"]
 
-def page_html():
+def page_html(company_id, company):
     with open(os.path.join(HERE, "demo.html"), encoding="utf-8") as f:
         page = f.read()
-    return (page.replace("__BUSINESS__", COMPANY["business"]).replace("__CITY__", COMPANY["city"])
-                .replace("__MODEL__", MODEL).replace("__SERVICES__", COMPANY["services"]))
+    return (page.replace("__BUSINESS__", company["business"]).replace("__CITY__", company["city"])
+                .replace("__MODEL__", MODEL).replace("__SERVICES__", company.get("services", ""))
+                .replace("__COMPANY_ID__", company_id))
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="application/json"):
@@ -180,39 +245,74 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(code); self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
 
+    def _query(self):
+        q = self.path.split("?", 1)
+        return urllib.parse.parse_qs(q[1]) if len(q) > 1 else {}
+
     def do_GET(self):
         if self.path.split("?")[0] in ("/", "/index.html"):
-            self._send(200, page_html(), "text/html; charset=utf-8")
+            cid = (self._query().get("c", [""])[0])
+            slug, tenant = get_tenant(cid)
+            self._send(200, page_html(slug, tenant["company"]), "text/html; charset=utf-8")
         else:
             self._send(404, "not found", "text/plain")
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(n) if n else b"{}"
+        data = json.loads(raw or b"{}")
         if self.path == "/token":
+            _, tenant = get_tenant(data.get("c", ""))
+            company = tenant["company"]
             try:
-                self._send(200, json.dumps({"token": mint_token(), "model": MODEL, "voice": VOICE,
-                                            "systemInstruction": persona(COMPANY), "tools": TOOLS}))
+                self._send(200, json.dumps({"token": mint_token(company), "model": MODEL, "voice": VOICE,
+                                            "systemInstruction": persona(company), "tools": TOOLS}))
             except urllib.error.HTTPError as e:
                 self._send(500, json.dumps({"error": e.read().decode("utf-8", "ignore")}))
         elif self.path == "/tool":
-            data = json.loads(raw or b"{}")
+            slug, tenant = get_tenant(data.get("c", ""))
             tool, args = data.get("tool", ""), data.get("args", {})
-            out = gb.run_tool(tool, args, COMPANY)
-            print(f"  -> tool {tool}({json.dumps(args)}) = {out['result']}")
+            out = gb.run_tool(tool, args, tenant)
+            print(f"  -> [{slug}] tool {tool}({json.dumps(args)}) = {out['result']}")
             self._send(200, json.dumps(out))
+        elif self.path == "/provision":
+            self._provision(data)
         else:
             self._send(404, json.dumps({"error": "not found"}))
+
+    def _provision(self, data):
+        if PROVISION_SECRET and data.get("secret") != PROVISION_SECRET:
+            self._send(403, json.dumps({"error": "forbidden"})); return
+        business = (data.get("business") or "").strip()
+        if not business:
+            self._send(400, json.dumps({"error": "business is required"})); return
+        company = scrape_profile(business, (data.get("city") or "").strip(),
+                                 data.get("website", ""), data.get("phone", ""))
+        for k, v in (data.get("overrides") or {}).items():   # owner corrections from the approval reply
+            if isinstance(v, str) and v.strip():
+                company[k] = v.strip()
+        res = gb.provision_company(company, data.get("owner_email") or OWNER_EMAIL)
+        if res.get("error"):
+            self._send(500, json.dumps(res)); return
+        slug = base = _slug(business); i = 2
+        while slug in TENANTS:   # never overwrite an existing company
+            slug = f"{base}-{i}"; i += 1
+        TENANTS[slug] = {"company": company, "sheet_id": res["sheet_id"], "calendar_id": res["calendar_id"]}
+        save_tenants(TENANTS)
+        base_url = PUBLIC_BASE or f"http://{self.headers.get('Host', 'localhost:'+str(PORT))}"
+        print(f"  -> provisioned [{slug}] {business}: sheet {res['sheet_id']}, calendar {res['calendar_id']}")
+        self._send(200, json.dumps({"companyId": slug, "demo_url": f"{base_url}/?c={slug}",
+                                    "sheet_url": res.get("sheet_url"), "calendar_id": res["calendar_id"],
+                                    "share_warning": res.get("share_warning")}))
 
     def log_message(self, *a):
         pass
 
 if __name__ == "__main__":
     socketserver.TCPServer.allow_reuse_address = True
-    print(f"\n  Receptionist for: {COMPANY['business']} ({COMPANY['city']})")
-    print("  Grounding the company via web search...")
-    wf = get_web_facts(COMPANY)
-    print("  web facts:", (wf[:90] + "...") if wf else "(none found - using owner-declared facts only)")
+    print(f"\n  Receptionist server — {len(TENANTS)} company(ies) loaded:")
+    for slug, t in TENANTS.items():
+        print(f"    - {t['company']['business']}  ->  /?c={slug}")
     with socketserver.TCPServer(("127.0.0.1", PORT), Handler) as httpd:
         print(f"  Open:  http://localhost:{PORT}    (Ctrl+C to stop)\n")
         try:

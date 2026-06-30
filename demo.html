@@ -49,6 +49,8 @@
 <script type="module">
 import { GoogleGenAI, Modality } from "https://esm.sh/@google/genai@1";
 
+const COMPANY_ID = "__COMPANY_ID__";   // which company's profile + Sheet/Calendar this page talks to
+
 const btn = document.getElementById("btn");
 const statusEl = document.getElementById("status");
 const logEl = document.getElementById("log");
@@ -111,7 +113,8 @@ function stopPlayback(){ for (const s of sources){ try{s.stop();}catch(e){} } so
 async function start(){
   btn.disabled = true; setStatus("Connecting…"); logEl.innerHTML = "";
   // 1) get a single-use token from our server (real key never reaches the browser)
-  const r = await fetch("/token", { method:"POST" });
+  const r = await fetch("/token", { method:"POST", headers:{ "Content-Type":"application/json" },
+                                    body: JSON.stringify({ c: COMPANY_ID }) });
   const cfg = await r.json();
   if (cfg.error){ setStatus("Token error: "+cfg.error); btn.disabled=false; return; }
   const ai = new GoogleGenAI({ apiKey: cfg.token, httpOptions:{ apiVersion:"v1alpha" } });
@@ -201,7 +204,7 @@ async function onMessage(msg){
       let result = "ok";
       try {
         const br = await fetch("/tool", { method:"POST", headers:{ "Content-Type":"application/json" },
-                                          body: JSON.stringify({ tool: fc.name, args: fc.args || {} }) });
+                                          body: JSON.stringify({ c: COMPANY_ID, tool: fc.name, args: fc.args || {} }) });
         result = (await br.json()).result || "ok";
       } catch(e){ result = "tool error"; }
       if (fc.name !== "log_call") addRow("sys", "✓ " + result);

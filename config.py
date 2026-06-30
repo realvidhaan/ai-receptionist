@@ -23,6 +23,10 @@ CALENDAR_ID  = os.environ.get("CALENDAR_ID", "")
 SMTP_USER    = os.environ.get("SMTP_USER", "")
 SMTP_PW      = os.environ.get("SMTP_PW", "")
 OWNER_EMAIL  = os.environ.get("OWNER_EMAIL", "")
+# shared secret the /provision endpoint requires (set the same value in the n8n call); "" = no check
+PROVISION_SECRET = os.environ.get("PROVISION_SECRET", "")
+# public base URL (e.g. your cloudflared tunnel) used to build demo links; "" = use the request Host header
+PUBLIC_BASE      = os.environ.get("PUBLIC_BASE", "").rstrip("/")
 
 # --- non-secret settings (override via .env if desired) ---
 TZ    = os.environ.get("TZ", "America/Los_Angeles")

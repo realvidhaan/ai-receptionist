@@ -1,6 +1,11 @@
 """
 Real Google backend for the voice receptionist (service account).
 Appointments -> Google Calendar (no overlaps allowed). Customers + Call Log -> Google Sheet. Confirmations/transfer -> SMTP.
+
+Multi-tenant: every Calendar/Sheet call takes the company's own sheet_id / calendar_id, so one service
+account drives an unlimited number of companies. run_tool(tool, args, tenant) where
+tenant = {"company": {...}, "sheet_id": "...", "calendar_id": "..."}.
+
 Secrets come from config.py (.env).
 """
 import json, os, re, ssl, smtplib, urllib.request, urllib.error, urllib.parse, datetime
@@ -13,8 +18,6 @@ import google.auth.transport.requests as gtr
 import config
 
 CTX = ssl.create_default_context(cafile=certifi.where())
-SHEET_ID = config.SHEET_ID
-CAL_ID = config.CALENDAR_ID
 TZ = config.TZ
 ZONE = ZoneInfo(TZ)
 SMTP_USER, SMTP_PW, OWNER_EMAIL = config.SMTP_USER, config.SMTP_PW.replace(" ", ""), config.OWNER_EMAIL
@@ -22,10 +25,13 @@ MAPS_KEY = config.MAPS_KEY
 CITY_TYPES = {"locality", "postal_town", "sublocality", "sublocality_level_1", "administrative_area_level_3"}
 
 HEADERS = ["phone", "name", "email", "address", "last_service", "notes", "status", "event_id", "appt_time"]
+LOG_HEADERS = ["timestamp", "caller", "phone", "intent", "outcome", "summary"]
 
+# drive.file lets the SA share the Sheets it creates with the owner (needs Drive API enabled on the project).
 _creds = service_account.Credentials.from_service_account_file(
     config.SA_KEY_PATH, scopes=["https://www.googleapis.com/auth/calendar",
-                                "https://www.googleapis.com/auth/spreadsheets"])
+                                "https://www.googleapis.com/auth/spreadsheets",
+                                "https://www.googleapis.com/auth/drive.file"])
 
 def _token():
     if not _creds.valid:
@@ -42,22 +48,22 @@ def _req(method, url, body=None):
     except urllib.error.HTTPError as e:
         return {"_err": e.code, "_body": e.read().decode("utf-8", "ignore")[:300]}
 
-# ---------- Calendar ----------
-def _cal(p): return f"https://www.googleapis.com/calendar/v3/calendars/{urllib.parse.quote(CAL_ID)}/events{p}"
-def cal_create(ev):    return _req("POST", _cal(""), ev)
-def cal_patch(eid, ev): return _req("PATCH", _cal(f"/{eid}"), ev)
-def cal_delete(eid):   return _req("DELETE", _cal(f"/{eid}"))
-def cal_list(tmin, tmax):
+# ---------- Calendar (per-tenant calendar_id) ----------
+def _cal(cid, p): return f"https://www.googleapis.com/calendar/v3/calendars/{urllib.parse.quote(cid)}/events{p}"
+def cal_create(cid, ev):     return _req("POST", _cal(cid, ""), ev)
+def cal_patch(cid, eid, ev): return _req("PATCH", _cal(cid, f"/{eid}"), ev)
+def cal_delete(cid, eid):    return _req("DELETE", _cal(cid, f"/{eid}"))
+def cal_list(cid, tmin, tmax):
     q = urllib.parse.urlencode({"timeMin": tmin, "timeMax": tmax, "singleEvents": "true", "orderBy": "startTime"})
-    return _req("GET", _cal(f"?{q}")).get("items", [])
+    return _req("GET", _cal(cid, f"?{q}")).get("items", [])
 
-# ---------- Sheets ----------
-def _sheet_get(rng):
-    return _req("GET", f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/{urllib.parse.quote(rng)}").get("values", [])
-def _sheet_update(rng, values):
-    return _req("PUT", f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/{urllib.parse.quote(rng)}?valueInputOption=USER_ENTERED", {"values": values})
-def _sheet_append(rng, values):
-    return _req("POST", f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/{urllib.parse.quote(rng)}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS", {"values": values})
+# ---------- Sheets (per-tenant sheet_id) ----------
+def _sheet_get(sid, rng):
+    return _req("GET", f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{urllib.parse.quote(rng)}").get("values", [])
+def _sheet_update(sid, rng, values):
+    return _req("PUT", f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{urllib.parse.quote(rng)}?valueInputOption=USER_ENTERED", {"values": values})
+def _sheet_append(sid, rng, values):
+    return _req("POST", f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{urllib.parse.quote(rng)}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS", {"values": values})
 
 def _digits(p):
     """Last 10 digits, so '(408) 555-0199', '408-555-0199', '+1 408 555 0199' all match."""
@@ -98,22 +104,22 @@ def _name_match(a, b):
     a, b = (a or "").strip().lower(), (b or "").strip().lower()
     return bool(a) and bool(b) and (a == b or a in b or b in a)
 
-def _find_customer(phone):
+def _find_customer(sid, phone):
     target = _digits(phone)
     if not target:
         return None, None
-    for i, row in enumerate(_sheet_get("Customers!A2:I")):
+    for i, row in enumerate(_sheet_get(sid, "Customers!A2:I")):
         if row and _digits(row[0]) == target:
             return i + 2, {HEADERS[j]: (row[j] if j < len(row) else "") for j in range(len(HEADERS))}
     return None, None
 
-def _upsert_customer(d):
+def _upsert_customer(sid, d):
     row = [d.get(h, "") for h in HEADERS]
-    idx, _ = _find_customer(d.get("phone", ""))
+    idx, _ = _find_customer(sid, d.get("phone", ""))
     if idx:
-        _sheet_update(f"Customers!A{idx}:I{idx}", [row])
+        _sheet_update(sid, f"Customers!A{idx}:I{idx}", [row])
     else:
-        _sheet_append("Customers!A:I", [row])
+        _sheet_append(sid, "Customers!A:I", [row])
 
 # ---------- time helpers ----------
 def _to_dt(s):
@@ -126,10 +132,10 @@ def _to_dt(s):
 def _pretty(dt): return dt.strftime("%a %b %-d at %-I:%M %p")
 def _ampm(dt):   return dt.strftime("%-I:%M %p")
 
-def _email(to, subject, body):
+def _email(to, subject, body, from_name="Receptionist"):
     try:
         m = MIMEText(body, "plain"); m["Subject"] = subject
-        m["From"] = formataddr((config.COMPANY["business"], SMTP_USER)); m["To"] = to
+        m["From"] = formataddr((from_name, SMTP_USER)); m["To"] = to
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=CTX, timeout=20) as s:
             s.login(SMTP_USER, SMTP_PW); s.sendmail(SMTP_USER, [to], m.as_string())
         return True
@@ -137,23 +143,23 @@ def _email(to, subject, body):
         print("  (email failed:", str(e)[:120], ")"); return False
 
 # ---------- scheduling / conflict logic ----------
-def _conflicts(start, end, exclude_id=None):
+def _conflicts(cid, start, end, exclude_id=None):
     """Return overlapping non-cancelled events in [start, end)."""
     out = []
-    for e in cal_list(start.isoformat(), end.isoformat()):
+    for e in cal_list(cid, start.isoformat(), end.isoformat()):
         if e.get("status") == "cancelled" or e.get("id") == exclude_id:
             continue
         if e.get("start", {}).get("dateTime"):  # skip all-day
             out.append(e)
     return out
 
-def _free_slots(day, duration_min, company):
+def _free_slots(cid, day, duration_min, company):
     """Real open start-times on `day` within business hours that fit `duration_min` without overlap."""
     oh, ch = company.get("open_hour", 8), company.get("close_hour", 18)
     day_start = datetime.datetime.combine(day, datetime.time(0, 0), ZONE)
     day_end = datetime.datetime.combine(day, datetime.time(23, 59), ZONE)
     busy = []
-    for e in cal_list(day_start.isoformat(), day_end.isoformat()):
+    for e in cal_list(cid, day_start.isoformat(), day_end.isoformat()):
         if e.get("status") == "cancelled":
             continue
         st, en = e.get("start", {}).get("dateTime"), e.get("end", {}).get("dateTime")
@@ -169,14 +175,63 @@ def _free_slots(day, duration_min, company):
         h += 1
     return slots
 
-def _alts(day, duration_min, company):
-    slots = _free_slots(day, duration_min, company)
+def _alts(cid, day, duration_min, company):
+    slots = _free_slots(cid, day, duration_min, company)
     if slots:
         return "We have openings at " + ", ".join(_ampm(s) for s in slots[:4]) + ". Which works?"
     return "We're fully booked that day. Would another day work?"
 
+# ---------- provisioning: create a fresh Sheet + Calendar for a new company ----------
+def create_calendar(summary, tz):
+    """Create a secondary calendar owned by the service account. Returns its id (or {_err}})."""
+    return _req("POST", "https://www.googleapis.com/calendar/v3/calendars", {"summary": summary, "timeZone": tz})
+
+def share_calendar(cid, email, role="writer"):
+    """Grant a human owner access to the calendar via its ACL (uses the Calendar scope)."""
+    return _req("POST", f"https://www.googleapis.com/calendar/v3/calendars/{urllib.parse.quote(cid)}/acl",
+                {"role": role, "scope": {"type": "user", "value": email}})
+
+def create_sheet(title):
+    """Create a spreadsheet with Customers + Call Log tabs and header rows. Returns {spreadsheet_id, url} or {_err}."""
+    body = {"properties": {"title": title},
+            "sheets": [{"properties": {"title": "Customers"}}, {"properties": {"title": "Call Log"}}]}
+    r = _req("POST", "https://sheets.googleapis.com/v4/spreadsheets", body)
+    if "_err" in r:
+        return r
+    sid = r["spreadsheetId"]
+    _sheet_update(sid, "Customers!A1:I1", [HEADERS])
+    _sheet_update(sid, "'Call Log'!A1:F1", [LOG_HEADERS])
+    return {"spreadsheet_id": sid, "url": r.get("spreadsheetUrl")}
+
+def share_file(file_id, email, role="writer"):
+    """Share an SA-created Drive file (the Sheet) with a human owner. Needs the drive.file scope + Drive API."""
+    return _req("POST", f"https://www.googleapis.com/drive/v3/files/{file_id}/permissions?sendNotificationEmail=false",
+                {"role": role, "type": "user", "emailAddress": email})
+
+def provision_company(company, owner_email):
+    """Create this company's own Calendar + Sheet, share both with the owner. Returns
+    {sheet_id, calendar_id, sheet_url} on success, or {error, detail}."""
+    biz = company.get("business", "HVAC Company")
+    tz = company.get("tz", TZ)
+    cal = create_calendar(f"{biz} - Appointments", tz)
+    if "_err" in cal or not cal.get("id"):
+        return {"error": "could not create calendar", "detail": cal}
+    cid = cal["id"]
+    share_calendar(cid, owner_email, "writer")
+    sh = create_sheet(f"{biz} - Receptionist DB")
+    if "_err" in sh:
+        return {"error": "could not create sheet (is the Drive API enabled?)", "detail": sh}
+    sid = sh["spreadsheet_id"]
+    share = share_file(sid, owner_email, "writer")
+    out = {"calendar_id": cid, "sheet_id": sid, "sheet_url": sh.get("url")}
+    if "_err" in share:   # sheet exists but couldn't be shared (Drive API/scope) - surface it, don't fail hard
+        out["share_warning"] = share
+    return out
+
 # ---------- the tools ----------
-def run_tool(tool, args, company):
+def run_tool(tool, args, tenant):
+    company = tenant["company"]
+    sid, cid = tenant["sheet_id"], tenant["calendar_id"]
     biz = company.get("business", "the business")
     dur = int(args.get("duration_min") or company.get("default_duration_min", 60))
 
@@ -186,7 +241,7 @@ def run_tool(tool, args, company):
             day = datetime.date.fromisoformat(date[:10])
         except Exception:
             return {"result": "What day would you like? I can check availability."}
-        slots = _free_slots(day, dur, company)
+        slots = _free_slots(cid, day, dur, company)
         if not slots:
             return {"result": f"We're fully booked on {day.strftime('%A, %b %-d')}. Want me to check another day?"}
         return {"result": f"On {day.strftime('%A, %b %-d')} we have openings at: {', '.join(_ampm(s) for s in slots[:4])}."}
@@ -203,9 +258,9 @@ def run_tool(tool, args, company):
         except Exception:
             return {"result": "What time works for you? I can book it then."}
         end = start + datetime.timedelta(minutes=dur)
-        if _conflicts(start, end):  # hard double-booking / overlap guard
-            return {"result": f"Sorry, {_pretty(start)} is already booked. {_alts(start.date(), dur, company)}"}
-        ev = cal_create({
+        if _conflicts(cid, start, end):  # hard double-booking / overlap guard
+            return {"result": f"Sorry, {_pretty(start)} is already booked. {_alts(cid, start.date(), dur, company)}"}
+        ev = cal_create(cid, {
             "summary": f"{issue} - {name}",
             "description": f"Booked by {biz} AI receptionist.\nName: {name}\nPhone: {phone}\nAddress: {addr_fmt}\nIssue: {issue}",
             "start": {"dateTime": start.isoformat(), "timeZone": TZ},
@@ -215,17 +270,18 @@ def run_tool(tool, args, company):
         })
         if "_err" in ev:
             return {"result": "I had trouble saving that to the calendar, so let me take a message and have the office confirm."}
-        _upsert_customer({"phone": phone, "name": name, "email": args.get("email", ""),
-                          "address": addr_fmt, "last_service": issue, "notes": "",
-                          "status": "booked", "event_id": ev["id"], "appt_time": start.isoformat()})
+        _upsert_customer(sid, {"phone": phone, "name": name, "email": args.get("email", ""),
+                               "address": addr_fmt, "last_service": issue, "notes": "",
+                               "status": "booked", "event_id": ev["id"], "appt_time": start.isoformat()})
         if args.get("email"):
             _email(args["email"], f"Your appointment with {biz}",
-                   f"Hi {name},\n\nYou're booked with {biz} for {_pretty(start)}.\nService: {issue}\nAddress: {addr_fmt}\n\nReply or call us to make changes.\n\n- {biz}")
+                   f"Hi {name},\n\nYou're booked with {biz} for {_pretty(start)}.\nService: {issue}\nAddress: {addr_fmt}\n\nReply or call us to make changes.\n\n- {biz}",
+                   from_name=biz)
         return {"result": f"Booked {name} for {_pretty(start)} ({issue})."
                           + (" A confirmation email is on the way." if args.get('email') else "")}
 
     if tool == "reschedule_appointment":
-        idx, cust = _find_customer(args.get("phone", ""))
+        idx, cust = _find_customer(sid, args.get("phone", ""))
         if not cust or not cust.get("event_id"):
             return {"result": "I couldn't find an active appointment under that number."}
         if args.get("caller_name") and not _name_match(args["caller_name"], cust.get("name", "")):
@@ -235,33 +291,33 @@ def run_tool(tool, args, company):
         except Exception:
             return {"result": "What new time would you like?"}
         end = start + datetime.timedelta(minutes=dur)
-        if _conflicts(start, end, exclude_id=cust["event_id"]):
-            return {"result": f"Sorry, {_pretty(start)} is already taken. {_alts(start.date(), dur, company)}"}
-        r = cal_patch(cust["event_id"], {"start": {"dateTime": start.isoformat(), "timeZone": TZ},
-                                         "end": {"dateTime": end.isoformat(), "timeZone": TZ}})
+        if _conflicts(cid, start, end, exclude_id=cust["event_id"]):
+            return {"result": f"Sorry, {_pretty(start)} is already taken. {_alts(cid, start.date(), dur, company)}"}
+        r = cal_patch(cid, cust["event_id"], {"start": {"dateTime": start.isoformat(), "timeZone": TZ},
+                                              "end": {"dateTime": end.isoformat(), "timeZone": TZ}})
         if "_err" in r:
             return {"result": "I couldn't move that appointment - it may have been removed."}
         cust["appt_time"] = start.isoformat()
-        _sheet_update(f"Customers!A{idx}:I{idx}", [[cust.get(h, "") for h in HEADERS]])
+        _sheet_update(sid, f"Customers!A{idx}:I{idx}", [[cust.get(h, "") for h in HEADERS]])
         return {"result": f"Moved your appointment to {_pretty(start)}."}
 
     if tool == "cancel_appointment":
-        idx, cust = _find_customer(args.get("phone", ""))
+        idx, cust = _find_customer(sid, args.get("phone", ""))
         if not cust or not cust.get("event_id"):
             return {"result": "I couldn't find an active appointment under that number."}
         if args.get("caller_name") and not _name_match(args["caller_name"], cust.get("name", "")):
             return {"result": "Just to confirm I have the right appointment - what's the name it's booked under?"}
-        cal_delete(cust["event_id"])
+        cal_delete(cid, cust["event_id"])
         cust["status"] = "cancelled"; cust["event_id"] = ""
-        _sheet_update(f"Customers!A{idx}:I{idx}", [[cust.get(h, "") for h in HEADERS]])
+        _sheet_update(sid, f"Customers!A{idx}:I{idx}", [[cust.get(h, "") for h in HEADERS]])
         return {"result": "Your appointment is cancelled. Anything else?"}
 
     if tool == "lookup_customer":
         phone = args.get("phone", "")
-        idx, cust = _find_customer(phone) if phone else (None, None)
+        idx, cust = _find_customer(sid, phone) if phone else (None, None)
         if not cust and args.get("name"):
             nm = args["name"].lower()
-            for row in _sheet_get("Customers!A2:I"):
+            for row in _sheet_get(sid, "Customers!A2:I"):
                 if len(row) > 1 and nm in row[1].lower():
                     cust = {HEADERS[j]: (row[j] if j < len(row) else "") for j in range(len(HEADERS))}; break
         if not cust:
@@ -274,13 +330,14 @@ def run_tool(tool, args, company):
 
     if tool == "log_call":
         ts = datetime.datetime.now(ZONE).strftime("%Y-%m-%d %H:%M")
-        _sheet_append("'Call Log'!A:F", [[ts, args.get("caller_name", ""), args.get("phone", ""),
-                                          args.get("intent", ""), args.get("outcome", ""), args.get("summary", "")]])
+        _sheet_append(sid, "'Call Log'!A:F", [[ts, args.get("caller_name", ""), args.get("phone", ""),
+                                               args.get("intent", ""), args.get("outcome", ""), args.get("summary", "")]])
         return {"result": "logged"}
 
     if tool == "transfer_to_human":
         _email(OWNER_EMAIL, f"[Receptionist] Callback request - {biz}",
-               f"A caller asked for a human.\nReason: {args.get('reason','')}\nCaller: {args.get('caller_name','')}\nCallback: {args.get('callback_number','')}")
+               f"A caller asked for a human.\nReason: {args.get('reason','')}\nCaller: {args.get('caller_name','')}\nCallback: {args.get('callback_number','')}",
+               from_name=biz)
         return {"result": "I've passed this to the team and someone will call you back shortly."}
 
     return {"result": f"(unknown tool {tool})"}
