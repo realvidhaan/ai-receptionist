@@ -58,6 +58,11 @@ let running = false, session = null, inCtx = null, outCtx = null, proc = null, m
 let nextStart = 0; const sources = new Set();
 let curMe = null, curAi = null;   // streaming transcript rows
 
+// auto-hangup after 60s of silence (no speech from caller AND none from the receptionist)
+const IDLE_MS = 60000, SPEECH_LEVEL = 0.02;
+let lastActivity = 0, idleTimer = null;
+function bumpActivity(){ lastActivity = performance.now(); }
+
 function setStatus(t){ statusEl.textContent = t; }
 function addRow(kind, text){
   const div = document.createElement("div");
@@ -89,6 +94,7 @@ function pcm16FromFloat(float32, srcRate){
 
 // play 24kHz PCM16 chunk, scheduled back-to-back
 function playChunk(b64){
+  bumpActivity();                       // receptionist is speaking -> call is active
   const bytes = b64ToBytes(b64);
   const pcm = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength/2);
   const buf = outCtx.createBuffer(1, pcm.length, 24000);
@@ -141,12 +147,22 @@ async function start(){
   proc.onaudioprocess = (ev) => {
     if (!running) return;
     const data = ev.inputBuffer.getChannelData(0);
+    let peak = 0;
+    for (let i=0;i<data.length;i++){ const a = Math.abs(data[i]); if (a > peak) peak = a; }
+    if (peak > SPEECH_LEVEL) bumpActivity();   // caller is speaking (ignore silent frames)
     const b64 = pcm16FromFloat(data, inCtx.sampleRate);
     try { session.sendRealtimeInput({ audio:{ data:b64, mimeType:"audio/pcm;rate=16000" } }); } catch(e){}
   };
   micSource.connect(proc); proc.connect(inCtx.destination);
 
   running = true;
+  bumpActivity();
+  idleTimer = setInterval(() => {
+    if (running && performance.now() - lastActivity > IDLE_MS){
+      addRow("sys", "No activity for 60 seconds — ending the call.");
+      stop();
+    }
+  }, 1000);
   btn.disabled = false; btn.textContent = "⏹  End call"; btn.classList.add("stop");
   addRow("sys", "Call connected. The receptionist is listening…");
   // make the receptionist greet first, proactively, the moment the call connects
@@ -196,6 +212,7 @@ async function onMessage(msg){
 
 function stop(){
   running = false; orb.classList.remove("live");
+  if (idleTimer){ clearInterval(idleTimer); idleTimer = null; }
   try { proc && (proc.onaudioprocess = null); micSource && micSource.disconnect(); proc && proc.disconnect(); } catch(e){}
   try { micStream && micStream.getTracks().forEach(t=>t.stop()); } catch(e){}
   stopPlayback();
