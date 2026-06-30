@@ -18,6 +18,8 @@ CAL_ID = config.CALENDAR_ID
 TZ = config.TZ
 ZONE = ZoneInfo(TZ)
 SMTP_USER, SMTP_PW, OWNER_EMAIL = config.SMTP_USER, config.SMTP_PW.replace(" ", ""), config.OWNER_EMAIL
+MAPS_KEY = config.MAPS_KEY
+CITY_TYPES = {"locality", "postal_town", "sublocality", "sublocality_level_1", "administrative_area_level_3"}
 
 HEADERS = ["phone", "name", "email", "address", "last_service", "notes", "status", "event_id", "appt_time"]
 
@@ -60,6 +62,37 @@ def _sheet_append(rng, values):
 def _digits(p):
     """Last 10 digits, so '(408) 555-0199', '408-555-0199', '+1 408 555 0199' all match."""
     return re.sub(r"\D", "", p or "")[-10:]
+
+def _valid_phone(p):
+    """Real US/NANP number: 10 digits, area & exchange codes start 2-9 (rejects '6767', '0000000000')."""
+    d = re.sub(r"\D", "", p or "")
+    if len(d) == 11 and d[0] == "1":
+        d = d[1:]
+    return len(d) == 10 and d[0] in "23456789" and d[3] in "23456789"
+
+def _validate_address(addr):
+    """Confirm a real street address via Places API (New). Requires the caller to have stated the street
+    number AND city that Google resolves to, so vague input like 'my house' or 'Sunnyvale apartment' fails.
+    Returns (ok, normalized_formatted_address)."""
+    if not (addr or "").strip() or not MAPS_KEY:
+        return False, None
+    try:
+        req = urllib.request.Request("https://places.googleapis.com/v1/places:searchText",
+            data=json.dumps({"textQuery": addr}).encode(), method="POST",
+            headers={"Content-Type": "application/json", "X-Goog-Api-Key": MAPS_KEY,
+                     "X-Goog-FieldMask": "places.formattedAddress,places.addressComponents"})
+        r = json.load(urllib.request.urlopen(req, timeout=20, context=CTX))
+    except Exception:
+        return False, None
+    places = r.get("places", [])
+    if not places:
+        return False, None
+    comps = places[0].get("addressComponents", [])
+    snum = next((c["longText"] for c in comps if "street_number" in c.get("types", [])), None)
+    city = next((c["longText"] for c in comps if CITY_TYPES & set(c.get("types", []))), None)
+    inp = addr.lower()
+    ok = bool(snum) and snum in addr and bool(city) and city.lower() in inp
+    return (ok, places[0].get("formattedAddress")) if ok else (False, None)
 
 def _name_match(a, b):
     a, b = (a or "").strip().lower(), (b or "").strip().lower()
@@ -159,31 +192,36 @@ def run_tool(tool, args, company):
         return {"result": f"On {day.strftime('%A, %b %-d')} we have openings at: {', '.join(_ampm(s) for s in slots[:4])}."}
 
     if tool == "book_appointment":
+        name, phone, issue = args.get("caller_name", ""), args.get("phone", ""), args.get("issue", "service")
+        if not _valid_phone(phone):
+            return {"result": "That doesn't look like a complete phone number. What's the best 10-digit number to reach you?"}
+        ok_addr, addr_fmt = _validate_address(args.get("address", ""))
+        if not ok_addr:
+            return {"result": "I couldn't find that address. Could you give me the full service address - street number, street name, and city?"}
         try:
             start = _to_dt(args["start_time"])
         except Exception:
             return {"result": "What time works for you? I can book it then."}
         end = start + datetime.timedelta(minutes=dur)
-        if _conflicts(start, end):  # <-- hard double-booking / overlap guard
+        if _conflicts(start, end):  # hard double-booking / overlap guard
             return {"result": f"Sorry, {_pretty(start)} is already booked. {_alts(start.date(), dur, company)}"}
-        name, phone, issue = args.get("caller_name", ""), args.get("phone", ""), args.get("issue", "service")
         ev = cal_create({
             "summary": f"{issue} - {name}",
-            "description": f"Booked by {biz} AI receptionist.\nName: {name}\nPhone: {phone}\nAddress: {args.get('address','')}\nIssue: {issue}",
+            "description": f"Booked by {biz} AI receptionist.\nName: {name}\nPhone: {phone}\nAddress: {addr_fmt}\nIssue: {issue}",
             "start": {"dateTime": start.isoformat(), "timeZone": TZ},
             "end": {"dateTime": end.isoformat(), "timeZone": TZ},
+            "location": addr_fmt,
             "extendedProperties": {"private": {"phone": phone}},
         })
         if "_err" in ev:
             return {"result": "I had trouble saving that to the calendar, so let me take a message and have the office confirm."}
-        code = ev["id"][-6:].upper()
         _upsert_customer({"phone": phone, "name": name, "email": args.get("email", ""),
-                          "address": args.get("address", ""), "last_service": issue, "notes": "",
+                          "address": addr_fmt, "last_service": issue, "notes": "",
                           "status": "booked", "event_id": ev["id"], "appt_time": start.isoformat()})
         if args.get("email"):
             _email(args["email"], f"Your appointment with {biz}",
-                   f"Hi {name},\n\nYou're booked with {biz} for {_pretty(start)}.\nService: {issue}\nConfirmation code: {code}\n\nReply or call us to make changes.\n\n- {biz}")
-        return {"result": f"Booked {name} for {_pretty(start)} ({issue}). Confirmation code {code}."
+                   f"Hi {name},\n\nYou're booked with {biz} for {_pretty(start)}.\nService: {issue}\nAddress: {addr_fmt}\n\nReply or call us to make changes.\n\n- {biz}")
+        return {"result": f"Booked {name} for {_pretty(start)} ({issue})."
                           + (" A confirmation email is on the way." if args.get('email') else "")}
 
     if tool == "reschedule_appointment":

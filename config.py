@@ -16,6 +16,7 @@ _load_env(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 # --- secrets / environment (set these in .env) ---
 GEMINI_KEY   = os.environ.get("GEMINI_KEY", "")
+MAPS_KEY     = os.environ.get("MAPS_KEY", "")   # Google Maps Platform key (Places API New) for address validation
 SA_KEY_PATH  = os.environ.get("SA_KEY_PATH", "")
 SHEET_ID     = os.environ.get("SHEET_ID", "")
 CALENDAR_ID  = os.environ.get("CALENDAR_ID", "")

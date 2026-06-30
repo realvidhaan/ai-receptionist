@@ -25,13 +25,13 @@ TOOLS = [{"functionDeclarations": [
         "duration_min": {"type": "NUMBER", "description": "appointment length in minutes (default 60)"}},
         "required": ["date"]}},
     {"name": "book_appointment",
-     "description": "Book a service appointment once you have the caller's name, phone, the issue, and a time. Two appointments can never overlap.",
+     "description": "Book a service appointment once you have the caller's name, a real 10-digit phone, a complete service address (street number, street name, and city), the issue, and a time. Two appointments can never overlap.",
      "parameters": {"type": "OBJECT", "properties": {
-        "caller_name": {"type": "STRING"}, "phone": {"type": "STRING"}, "email": {"type": "STRING"},
-        "address": {"type": "STRING"}, "issue": {"type": "STRING", "description": "what's wrong / service needed"},
+        "caller_name": {"type": "STRING"}, "phone": {"type": "STRING", "description": "real 10-digit US phone number"}, "email": {"type": "STRING"},
+        "address": {"type": "STRING", "description": "full service address: street number, street name, and city (e.g. 123 Main St, San Jose)"}, "issue": {"type": "STRING", "description": "what's wrong / service needed"},
         "start_time": {"type": "STRING", "description": "start time as ISO 8601, e.g. 2026-07-01T09:00:00"},
         "duration_min": {"type": "NUMBER"}},
-        "required": ["caller_name", "phone", "issue", "start_time"]}},
+        "required": ["caller_name", "phone", "address", "issue", "start_time"]}},
     {"name": "reschedule_appointment",
      "description": "Move an existing caller's appointment. Look up by phone; confirm the name it's booked under.",
      "parameters": {"type": "OBJECT", "properties": {
@@ -128,9 +128,10 @@ def persona(c):
         "HOW YOU WORK:\n"
         f"1) Open every call with: \"Welcome to {biz}! This is the virtual receptionist, how can I help you today?\" - UNLESS the "
         "caller's first words are a safety emergency, in which case skip the greeting and handle the emergency immediately.\n"
-        "2) To BOOK: get name, phone, the problem, and a preferred time. Use check_availability if they're unsure, then "
-        "book_appointment. Appointments can NEVER overlap - if a time is taken, offer the open times the tool returns. On success "
-        "the tool returns a confirmation code; read it back so they have it. Never invent a confirmation code.\n"
+        "2) To BOOK: get name, a real 10-digit phone number, the complete service address (street number, street name, and city), "
+        "the problem, and a preferred time. Use check_availability if they're unsure, then book_appointment. The phone and address "
+        "are verified for real - if the tool says the number or address isn't valid, politely ask the caller to repeat it in full and "
+        "try again; do not book without them. Appointments can NEVER overlap - if a time is taken, offer the open times the tool returns.\n"
         "3) To RESCHEDULE or CANCEL: get their phone and confirm the name the appointment is booked under before changing it.\n"
         "4) PAYMENT: nothing is charged to book and you never take payment on the call; the technician gives an upfront quote "
         "before any work. Reassure worried callers of this plainly and directly.\n"
