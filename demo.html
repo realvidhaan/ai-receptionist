@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>__BUSINESS__ — AI Receptionist</title>
+<style>
+  :root { --bg:#0b1220; --card:#121c2e; --accent:#3b82f6; --accent2:#22d3ee; --ok:#22c55e; --txt:#e8eef7; --mut:#8aa0bd; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:
+         radial-gradient(1200px 600px at 50% -10%, #16243d 0%, var(--bg) 60%); color:var(--txt);
+         min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px; }
+  .card { width:100%; max-width:520px; background:var(--card); border:1px solid #1f2e47; border-radius:20px;
+          padding:30px 28px 26px; box-shadow:0 20px 60px rgba(0,0,0,.45); }
+  .badge { font-size:12px; letter-spacing:.12em; text-transform:uppercase; color:var(--accent2); font-weight:700; }
+  h1 { margin:6px 0 2px; font-size:24px; }
+  .sub { color:var(--mut); font-size:14px; margin-bottom:20px; }
+  .orb-wrap { display:flex; justify-content:center; margin:8px 0 18px; }
+  .orb { width:120px; height:120px; border-radius:50%; background:radial-gradient(circle at 35% 30%, var(--accent2), var(--accent) 70%);
+         box-shadow:0 0 0 0 rgba(59,130,246,.5); transition:transform .15s ease; }
+  .orb.live { animation:pulse 1.4s infinite; }
+  @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(34,211,238,.5);} 70%{box-shadow:0 0 0 26px rgba(34,211,238,0);} 100%{box-shadow:0 0 0 0 rgba(34,211,238,0);} }
+  button { width:100%; border:0; border-radius:12px; padding:15px; font-size:16px; font-weight:700; cursor:pointer; color:#04101f;
+           background:linear-gradient(90deg,var(--accent2),var(--accent)); }
+  button.stop { background:linear-gradient(90deg,#f87171,#ef4444); color:#fff; }
+  button:disabled { opacity:.5; cursor:default; }
+  .status { text-align:center; color:var(--mut); font-size:13px; margin:14px 0 6px; min-height:18px; }
+  .log { background:#0c1525; border:1px solid #1c2a42; border-radius:12px; padding:12px 14px; margin-top:16px;
+         height:200px; overflow:auto; font-size:14px; line-height:1.5; }
+  .row { margin:6px 0; }
+  .who { font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--mut); }
+  .me .what { color:#cfe0f5; } .ai .what { color:#bff0d8; }
+  .sys { color:#f6c453; font-size:12.5px; }
+  .foot { margin-top:14px; font-size:11px; color:var(--mut); text-align:center; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="badge">Live AI Receptionist</div>
+    <h1>__BUSINESS__</h1>
+    <div class="sub">Tap below and talk. Ask about service, hours, or book an appointment. Serving __CITY__.</div>
+    <div class="orb-wrap"><div class="orb" id="orb"></div></div>
+    <button id="btn">🎙️  Talk to the receptionist</button>
+    <div class="status" id="status">Microphone stays on your device. Click to start.</div>
+    <div class="log" id="log"></div>
+    <div class="foot">Powered by your secure single-use session · no app, no phone number</div>
+  </div>
+
+<script type="module">
+import { GoogleGenAI, Modality } from "https://esm.sh/@google/genai@1";
+
+const btn = document.getElementById("btn");
+const statusEl = document.getElementById("status");
+const logEl = document.getElementById("log");
+const orb = document.getElementById("orb");
+
+let running = false, session = null, inCtx = null, outCtx = null, proc = null, micStream = null, micSource = null;
+let nextStart = 0; const sources = new Set();
+let curMe = null, curAi = null;   // streaming transcript rows
+
+function setStatus(t){ statusEl.textContent = t; }
+function addRow(kind, text){
+  const div = document.createElement("div");
+  div.className = "row " + (kind==="me"?"me":kind==="ai"?"ai":"sys");
+  if (kind==="sys"){ div.innerHTML = `<span class="what sys">${text}</span>`; }
+  else { div.innerHTML = `<div class="who">${kind==="me"?"You":"__BUSINESS__"}</div><div class="what">${text}</div>`; }
+  logEl.appendChild(div); logEl.scrollTop = logEl.scrollHeight; return div;
+}
+function appendTo(rowRef, kind, text){
+  if (!rowRef.el){ rowRef.el = addRow(kind, text); }
+  else { rowRef.el.querySelector(".what").textContent += text; logEl.scrollTop = logEl.scrollHeight; }
+}
+
+// base64 <-> bytes
+const b64ToBytes = b => { const s=atob(b); const a=new Uint8Array(s.length); for(let i=0;i<s.length;i++)a[i]=s.charCodeAt(i); return a; };
+const bytesToB64 = bytes => { let s=""; for(let i=0;i<bytes.length;i++)s+=String.fromCharCode(bytes[i]); return btoa(s); };
+
+// downsample Float32 @ srcRate -> Int16 @ 16000, return base64
+function pcm16FromFloat(float32, srcRate){
+  const ratio = srcRate / 16000;
+  const outLen = Math.floor(float32.length / ratio);
+  const out = new Int16Array(outLen);
+  for (let i=0;i<outLen;i++){
+    const s = Math.max(-1, Math.min(1, float32[Math.floor(i*ratio)]));
+    out[i] = s < 0 ? s*0x8000 : s*0x7fff;
+  }
+  return bytesToB64(new Uint8Array(out.buffer));
+}
+
+// play 24kHz PCM16 chunk, scheduled back-to-back
+function playChunk(b64){
+  const bytes = b64ToBytes(b64);
+  const pcm = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength/2);
+  const buf = outCtx.createBuffer(1, pcm.length, 24000);
+  const ch = buf.getChannelData(0);
+  for (let i=0;i<pcm.length;i++) ch[i] = pcm[i] / 32768;
+  const src = outCtx.createBufferSource(); src.buffer = buf; src.connect(outCtx.destination);
+  const now = outCtx.currentTime;
+  if (nextStart < now) nextStart = now;
+  src.start(nextStart); nextStart += buf.duration;
+  sources.add(src); src.onended = () => sources.delete(src);
+}
+function stopPlayback(){ for (const s of sources){ try{s.stop();}catch(e){} } sources.clear(); nextStart = 0; }
+
+async function start(){
+  btn.disabled = true; setStatus("Connecting…"); logEl.innerHTML = "";
+  // 1) get a single-use token from our server (real key never reaches the browser)
+  const r = await fetch("/token", { method:"POST" });
+  const cfg = await r.json();
+  if (cfg.error){ setStatus("Token error: "+cfg.error); btn.disabled=false; return; }
+  const ai = new GoogleGenAI({ apiKey: cfg.token, httpOptions:{ apiVersion:"v1alpha" } });
+
+  // 2) audio contexts: input is the device default rate; output is fixed at 24kHz
+  inCtx  = new (window.AudioContext||window.webkitAudioContext)();
+  outCtx = new (window.AudioContext||window.webkitAudioContext)({ sampleRate: 24000 });
+
+  // 3) connect the live session using the ephemeral token
+  session = await ai.live.connect({
+    model: cfg.model,
+    config: {
+      responseModalities: [Modality.AUDIO],
+      thinkingConfig: { thinkingBudget: 0 },   // stop reasoning from leaking into speech; reliable tool calls
+      speechConfig: cfg.voice ? { voiceConfig: { prebuiltVoiceConfig: { voiceName: cfg.voice } } } : undefined,
+      inputAudioTranscription: {},
+      outputAudioTranscription: {},
+      systemInstruction: cfg.systemInstruction,
+      tools: cfg.tools,
+    },
+    callbacks: {
+      onopen: () => { setStatus("Connected — say hello!"); orb.classList.add("live"); },
+      onmessage: onMessage,
+      onerror: (e) => { setStatus("Connection error: " + (e.message||e)); },
+      onclose: () => { if (running) setStatus("Session ended."); },
+    },
+  });
+
+  // 4) capture mic -> 16kHz PCM -> stream up
+  micStream = await navigator.mediaDevices.getUserMedia({ audio:{ channelCount:1, echoCancellation:true, noiseSuppression:true } });
+  micSource = inCtx.createMediaStreamSource(micStream);
+  proc = inCtx.createScriptProcessor(4096, 1, 1);
+  proc.onaudioprocess = (ev) => {
+    if (!running) return;
+    const data = ev.inputBuffer.getChannelData(0);
+    const b64 = pcm16FromFloat(data, inCtx.sampleRate);
+    try { session.sendRealtimeInput({ audio:{ data:b64, mimeType:"audio/pcm;rate=16000" } }); } catch(e){}
+  };
+  micSource.connect(proc); proc.connect(inCtx.destination);
+
+  running = true;
+  btn.disabled = false; btn.textContent = "⏹  End call"; btn.classList.add("stop");
+  addRow("sys", "Call connected. The receptionist is listening…");
+  // make the receptionist greet first, proactively, the moment the call connects
+  session.sendClientContent({ turns:[{ role:"user", parts:[{ text:"The call just connected. Greet me now exactly as instructed." }]}], turnComplete:true });
+}
+
+async function onMessage(msg){
+  const sc = msg.serverContent;
+  if (sc){
+    if (sc.interrupted) stopPlayback();
+    if (sc.inputTranscription?.text){
+      if (!curMe) curMe = {}; appendTo(curMe, "me", sc.inputTranscription.text);
+    }
+    if (sc.outputTranscription?.text){
+      if (!curAi) curAi = {}; appendTo(curAi, "ai", sc.outputTranscription.text);
+    }
+    for (const p of (sc.modelTurn?.parts || [])){
+      if (p.inlineData?.data) playChunk(p.inlineData.data);
+    }
+    if (sc.turnComplete){ curMe = null; curAi = null; }   // start fresh transcript rows next turn
+  }
+  // function calling: relay ANY tool the receptionist calls to the backend (/tool)
+  if (msg.toolCall){
+    const FRIENDLY = {
+      check_availability: "Checking the calendar…",
+      book_appointment: "Booking your appointment…",
+      reschedule_appointment: "Rescheduling your appointment…",
+      cancel_appointment: "Cancelling your appointment…",
+      lookup_customer: "Looking up your details…",
+      log_call: "",
+      transfer_to_human: "Connecting you with the team…",
+    };
+    for (const fc of msg.toolCall.functionCalls){
+      const note = (fc.name in FRIENDLY) ? FRIENDLY[fc.name] : "Working on it…";
+      if (note) addRow("sys", note);
+      let result = "ok";
+      try {
+        const br = await fetch("/tool", { method:"POST", headers:{ "Content-Type":"application/json" },
+                                          body: JSON.stringify({ tool: fc.name, args: fc.args || {} }) });
+        result = (await br.json()).result || "ok";
+      } catch(e){ result = "tool error"; }
+      if (fc.name !== "log_call") addRow("sys", "✓ " + result);
+      session.sendToolResponse({ functionResponses:[{ id:fc.id, name:fc.name, response:{ result } }] });
+    }
+  }
+}
+
+function stop(){
+  running = false; orb.classList.remove("live");
+  try { proc && (proc.onaudioprocess = null); micSource && micSource.disconnect(); proc && proc.disconnect(); } catch(e){}
+  try { micStream && micStream.getTracks().forEach(t=>t.stop()); } catch(e){}
+  stopPlayback();
+  try { session && session.close(); } catch(e){}
+  try { inCtx && inCtx.close(); outCtx && outCtx.close(); } catch(e){}
+  btn.textContent = "🎙️  Talk to the receptionist"; btn.classList.remove("stop");
+  logEl.innerHTML = "";   // reset the log each time the call ends
+  setStatus("Call ended. Click to talk again.");
+}
+
+btn.addEventListener("click", () => { running ? stop() : start().catch(e=>{ setStatus("Error: "+(e.message||e)); btn.disabled=false; }); });
+</script>
+</body>
+</html>

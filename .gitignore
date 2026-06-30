@@ -1,0 +1,23 @@
+# Secrets — never commit
+.env
+*.json
+!.env.example
+service-account*.json
+*-key.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Runtime / scratch
+store.json
+*.log
+*_out.txt
+_check.mjs
+node_modules/
+package-lock.json
+
+# OS
+.DS_Store
