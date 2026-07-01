@@ -107,7 +107,7 @@ _WEB_FACTS = {}
 def _gemini_search(prompt):
     body = {"contents": [{"parts": [{"text": prompt}]}], "tools": [{"google_search": {}}]}
     req = urllib.request.Request(
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}",
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={GEMINI_KEY}",
         data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}, method="POST")
     r = json.load(urllib.request.urlopen(req, timeout=60, context=CTX))
     parts = r["candidates"][0]["content"]["parts"]
