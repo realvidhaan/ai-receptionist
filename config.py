@@ -27,6 +27,8 @@ OWNER_EMAIL  = os.environ.get("OWNER_EMAIL", "")
 PROVISION_SECRET = os.environ.get("PROVISION_SECRET", "")
 # public base URL (e.g. your cloudflared tunnel) used to build demo links; "" = use the request Host header
 PUBLIC_BASE      = os.environ.get("PUBLIC_BASE", "").rstrip("/")
+# Apps Script web-app URL that creates owner-owned Sheets (personal SAs can't own files); "" = can't provision sheets
+SHEET_CREATOR_URL = os.environ.get("SHEET_CREATOR_URL", "")
 
 # --- non-secret settings (override via .env if desired) ---
 TZ    = os.environ.get("TZ", "America/Los_Angeles")

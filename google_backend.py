@@ -27,11 +27,12 @@ CITY_TYPES = {"locality", "postal_town", "sublocality", "sublocality_level_1", "
 HEADERS = ["phone", "name", "email", "address", "last_service", "notes", "status", "event_id", "appt_time"]
 LOG_HEADERS = ["timestamp", "caller", "phone", "intent", "outcome", "summary"]
 
-# drive.file lets the SA share the Sheets it creates with the owner (needs Drive API enabled on the project).
+# New Sheets are created by the owner's Apps Script web app (a personal-account service account has zero
+# Drive storage, so it can't own files). At runtime the SA only reads/writes calendars + shared sheets.
+SHEET_CREATOR_URL = config.SHEET_CREATOR_URL
 _creds = service_account.Credentials.from_service_account_file(
     config.SA_KEY_PATH, scopes=["https://www.googleapis.com/auth/calendar",
-                                "https://www.googleapis.com/auth/spreadsheets",
-                                "https://www.googleapis.com/auth/drive.file"])
+                                "https://www.googleapis.com/auth/spreadsheets"])
 
 def _token():
     if not _creds.valid:
@@ -192,41 +193,40 @@ def share_calendar(cid, email, role="writer"):
                 {"role": role, "scope": {"type": "user", "value": email}})
 
 def create_sheet(title):
-    """Create a spreadsheet with Customers + Call Log tabs and header rows. Returns {spreadsheet_id, url} or {_err}."""
-    body = {"properties": {"title": title},
-            "sheets": [{"properties": {"title": "Customers"}}, {"properties": {"title": "Call Log"}}]}
-    r = _req("POST", "https://sheets.googleapis.com/v4/spreadsheets", body)
-    if "_err" in r:
-        return r
-    sid = r["spreadsheetId"]
-    _sheet_update(sid, "Customers!A1:I1", [HEADERS])
-    _sheet_update(sid, "'Call Log'!A1:F1", [LOG_HEADERS])
-    return {"spreadsheet_id": sid, "url": r.get("spreadsheetUrl")}
-
-def share_file(file_id, email, role="writer"):
-    """Share an SA-created Drive file (the Sheet) with a human owner. Needs the drive.file scope + Drive API."""
-    return _req("POST", f"https://www.googleapis.com/drive/v3/files/{file_id}/permissions?sendNotificationEmail=false",
-                {"role": role, "type": "user", "emailAddress": email})
+    """Create a Customers+Call Log spreadsheet OWNED BY THE OWNER via their Apps Script web app, which also
+    shares it with this service account for runtime read/write. Returns {spreadsheet_id, url} or {_err}.
+    (Personal-account service accounts have zero Drive storage, so they can't create the file themselves.)"""
+    if not SHEET_CREATOR_URL:
+        return {"_err": "no_creator", "_body": "SHEET_CREATOR_URL not set - deploy the sheet-creator Apps Script."}
+    try:
+        body = json.dumps({"secret": config.PROVISION_SECRET, "title": title,
+                           "share_with": _creds.service_account_email,
+                           "customers_headers": HEADERS, "log_headers": LOG_HEADERS}).encode()
+        req = urllib.request.Request(SHEET_CREATOR_URL, data=body, method="POST",
+                                     headers={"Content-Type": "application/json"})
+        r = json.load(urllib.request.urlopen(req, timeout=60, context=CTX))
+    except Exception as e:
+        return {"_err": "creator", "_body": str(e)[:200]}
+    if r.get("spreadsheet_id"):
+        return {"spreadsheet_id": r["spreadsheet_id"], "url": r.get("url")}
+    return {"_err": "creator", "_body": str(r)[:200]}
 
 def provision_company(company, owner_email):
-    """Create this company's own Calendar + Sheet, share both with the owner. Returns
-    {sheet_id, calendar_id, sheet_url} on success, or {error, detail}."""
+    """Create this company's own Sheet + Calendar (both usable by the owner and this SA). Returns
+    {sheet_id, calendar_id, sheet_url} on success, or {error, detail}. Sheet is created first so a
+    sheet failure never leaves an orphaned calendar behind."""
     biz = company.get("business", "HVAC Company")
     tz = company.get("tz", TZ)
-    cal = create_calendar(f"{biz} - Appointments", tz)
-    if "_err" in cal or not cal.get("id"):
-        return {"error": "could not create calendar", "detail": cal}
-    cid = cal["id"]
-    share_calendar(cid, owner_email, "writer")
     sh = create_sheet(f"{biz} - Receptionist DB")
     if "_err" in sh:
-        return {"error": "could not create sheet (is the Drive API enabled?)", "detail": sh}
+        return {"error": "could not create sheet", "detail": sh}
     sid = sh["spreadsheet_id"]
-    share = share_file(sid, owner_email, "writer")
-    out = {"calendar_id": cid, "sheet_id": sid, "sheet_url": sh.get("url")}
-    if "_err" in share:   # sheet exists but couldn't be shared (Drive API/scope) - surface it, don't fail hard
-        out["share_warning"] = share
-    return out
+    cal = create_calendar(f"{biz} - Appointments", tz)
+    if "_err" in cal or not cal.get("id"):
+        return {"error": "could not create calendar", "detail": cal, "sheet_id": sid, "sheet_url": sh.get("url")}
+    cid = cal["id"]
+    share_calendar(cid, owner_email, "writer")
+    return {"calendar_id": cid, "sheet_id": sid, "sheet_url": sh.get("url")}
 
 # ---------- the tools ----------
 def run_tool(tool, args, tenant):
