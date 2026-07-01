@@ -1,8 +1,6 @@
 # Render Blueprint for the AI receptionist.
-# Deploy: Render dashboard -> New -> Blueprint -> connect this repo. Render reads this file,
-# prompts for the sync:false secrets, and gives you https://ai-receptionist.onrender.com.
-# Then: (1) add a Secret File named "sa-key.json" with your service-account key contents,
-#       (2) set PUBLIC_BASE to the service URL Render assigns.
+# Secrets are set as env vars (incl. SA_KEY_JSON = the full service-account JSON), so no files to upload.
+# After first deploy, set PUBLIC_BASE to the service URL Render assigns.
 services:
   - type: web
     name: ai-receptionist
@@ -11,10 +9,12 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: python server.py
     envVars:
-      - key: SA_KEY_PATH
-        value: /etc/secrets/sa-key.json      # upload the key as a Render Secret File
       - key: TZ
         value: America/Los_Angeles
+      - key: SA_KEY_JSON
+        sync: false
+      - key: SA_KEY_PATH
+        sync: false
       - key: GEMINI_KEY
         sync: false
       - key: MAPS_KEY

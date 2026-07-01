@@ -30,9 +30,11 @@ LOG_HEADERS = ["timestamp", "caller", "phone", "intent", "outcome", "summary"]
 # New Sheets are created by the owner's Apps Script web app (a personal-account service account has zero
 # Drive storage, so it can't own files). At runtime the SA only reads/writes calendars + shared sheets.
 SHEET_CREATOR_URL = config.SHEET_CREATOR_URL
-_creds = service_account.Credentials.from_service_account_file(
-    config.SA_KEY_PATH, scopes=["https://www.googleapis.com/auth/calendar",
-                                "https://www.googleapis.com/auth/spreadsheets"])
+_SCOPES = ["https://www.googleapis.com/auth/calendar", "https://www.googleapis.com/auth/spreadsheets"]
+if config.SA_KEY_JSON.strip():   # cloud: key comes from an env var (no file on disk)
+    _creds = service_account.Credentials.from_service_account_info(json.loads(config.SA_KEY_JSON), scopes=_SCOPES)
+else:                            # local: key file on disk
+    _creds = service_account.Credentials.from_service_account_file(config.SA_KEY_PATH, scopes=_SCOPES)
 
 def _token():
     if not _creds.valid:
