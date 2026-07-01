@@ -6,7 +6,7 @@ Voice receptionist server (Gemini Live + multi-tool, real Google backend).
   POST /tool    -> {tool, args} -> real Google Calendar/Sheets via google_backend
 Run:  python3 server.py   then open  http://localhost:<PORT>
 """
-import json, re, ssl, urllib.request, urllib.error, urllib.parse, datetime, http.server, socketserver, os
+import json, re, ssl, time, urllib.request, urllib.error, urllib.parse, datetime, http.server, socketserver, os
 from zoneinfo import ZoneInfo
 import certifi
 import config
@@ -16,37 +16,34 @@ CTX = ssl.create_default_context(cafile=certifi.where())
 HERE = os.path.dirname(os.path.abspath(__file__))
 GEMINI_KEY, MODEL, VOICE, PORT = config.GEMINI_KEY, config.MODEL, config.VOICE, config.PORT
 OWNER_EMAIL, PROVISION_SECRET, PUBLIC_BASE = config.OWNER_EMAIL, config.PROVISION_SECRET, config.PUBLIC_BASE
-TENANTS_PATH = os.path.join(HERE, "tenants.json")
 
-# ---- tenant registry: one company per slug, each with its own Sheet + Calendar ----
+# ---- tenant registry: the default company comes from .env; provisioned companies live in the master
+#      sheet's "Tenants" tab (disk-stateless, so this runs on any host). Cached with a short TTL. ----
 def _slug(s):
     return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", (s or "").lower())).strip("-") or "company"
 
-def save_tenants(t):
-    with open(TENANTS_PATH, "w", encoding="utf-8") as f:
-        json.dump(t, f, indent=2)
-
-def load_tenants():
-    if os.path.exists(TENANTS_PATH):
-        with open(TENANTS_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    # first run: migrate the single .env company as the default tenant so nothing breaks
-    c = dict(config.COMPANY)
-    t = {_slug(c["business"]): {"company": c, "sheet_id": config.SHEET_ID, "calendar_id": config.CALENDAR_ID}}
-    save_tenants(t)
-    return t
-
-TENANTS = load_tenants()
 DEFAULT_TENANT = _slug(config.COMPANY["business"])
+def default_tenant():
+    return {"company": dict(config.COMPANY), "sheet_id": config.SHEET_ID, "calendar_id": config.CALENDAR_ID}
+
+_REG = {"t": -1e9, "data": {}}
+REG_TTL = 60
+def registry(force=False):
+    if force or time.time() - _REG["t"] > REG_TTL:
+        try:
+            _REG["data"] = gb.registry_load(); _REG["t"] = time.time()
+        except Exception as e:
+            print("  (registry load failed:", str(e)[:100], ")")
+    return _REG["data"]
 
 def get_tenant(cid):
-    """Resolve a slug to (slug, tenant); fall back to the default/first company if unknown."""
-    if cid and cid in TENANTS:
-        return cid, TENANTS[cid]
-    if DEFAULT_TENANT in TENANTS:
-        return DEFAULT_TENANT, TENANTS[DEFAULT_TENANT]
-    first = next(iter(TENANTS))
-    return first, TENANTS[first]
+    """Resolve a slug to (slug, tenant); fall back to the default company if unknown."""
+    if not cid or cid == DEFAULT_TENANT:
+        return DEFAULT_TENANT, default_tenant()
+    reg = registry()
+    if cid in reg:
+        return cid, reg[cid]
+    return DEFAULT_TENANT, default_tenant()
 
 def _base_company(business, city):
     """Neutral, owner-reviewable defaults for a new HVAC company (no other company's specifics)."""
@@ -294,11 +291,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         res = gb.provision_company(company, data.get("owner_email") or OWNER_EMAIL)
         if res.get("error"):
             self._send(500, json.dumps(res)); return
+        reg = registry(force=True)
         slug = base = _slug(business); i = 2
-        while slug in TENANTS:   # never overwrite an existing company
+        while slug in reg or slug == DEFAULT_TENANT:   # never overwrite an existing company
             slug = f"{base}-{i}"; i += 1
-        TENANTS[slug] = {"company": company, "sheet_id": res["sheet_id"], "calendar_id": res["calendar_id"]}
-        save_tenants(TENANTS)
+        gb.registry_upsert(slug, company, res["sheet_id"], res["calendar_id"])
+        registry(force=True)   # refresh cache so the new demo link resolves immediately
         base_url = PUBLIC_BASE or f"http://{self.headers.get('Host', 'localhost:'+str(PORT))}"
         print(f"  -> provisioned [{slug}] {business}: sheet {res['sheet_id']}, calendar {res['calendar_id']}")
         self._send(200, json.dumps({"companyId": slug, "demo_url": f"{base_url}/?c={slug}",
@@ -310,10 +308,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     socketserver.TCPServer.allow_reuse_address = True
-    print(f"\n  Receptionist server — {len(TENANTS)} company(ies) loaded:")
-    for slug, t in TENANTS.items():
-        print(f"    - {t['company']['business']}  ->  /?c={slug}")
-    with socketserver.TCPServer(("127.0.0.1", PORT), Handler) as httpd:
+    try:
+        gb.ensure_registry()
+    except Exception as e:
+        print("  (could not ensure Tenants tab:", str(e)[:100], ")")
+    reg = registry(force=True)
+    print(f"\n  Receptionist server — default: {config.COMPANY['business']} (/?c={DEFAULT_TENANT}) + {len(reg)} provisioned")
+    with socketserver.TCPServer(("0.0.0.0", PORT), Handler) as httpd:
         print(f"  Open:  http://localhost:{PORT}    (Ctrl+C to stop)\n")
         try:
             httpd.serve_forever()

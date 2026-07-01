@@ -211,6 +211,46 @@ def create_sheet(title):
         return {"spreadsheet_id": r["spreadsheet_id"], "url": r.get("url")}
     return {"_err": "creator", "_body": str(r)[:200]}
 
+# ---------- tenant registry: persisted in a "Tenants" tab of the master sheet ----------
+# (a file-based registry would vanish on any ephemeral-filesystem host; the SA already has Sheets access,
+#  so the registry rides in the master spreadsheet and survives restarts/redeploys anywhere.)
+REGISTRY_SHEET = config.SHEET_ID
+REG_HEADERS = ["slug", "company_json", "sheet_id", "calendar_id"]
+
+def ensure_registry():
+    """Make sure the master sheet has a 'Tenants' tab with a header row."""
+    meta = _req("GET", f"https://sheets.googleapis.com/v4/spreadsheets/{REGISTRY_SHEET}?fields=sheets.properties.title")
+    titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    if "Tenants" not in titles:
+        _req("POST", f"https://sheets.googleapis.com/v4/spreadsheets/{REGISTRY_SHEET}:batchUpdate",
+             {"requests": [{"addSheet": {"properties": {"title": "Tenants"}}}]})
+        _sheet_update(REGISTRY_SHEET, "Tenants!A1:D1", [REG_HEADERS])
+
+def registry_load():
+    """Return {slug: {company, sheet_id, calendar_id}} from the Tenants tab."""
+    out = {}
+    for row in _sheet_get(REGISTRY_SHEET, "Tenants!A2:D"):
+        if not row or not row[0]:
+            continue
+        try:
+            company = json.loads(row[1]) if len(row) > 1 and row[1] else {}
+        except Exception:
+            company = {}
+        out[row[0]] = {"company": company,
+                       "sheet_id": row[2] if len(row) > 2 else "",
+                       "calendar_id": row[3] if len(row) > 3 else ""}
+    return out
+
+def registry_upsert(slug, company, sheet_id, calendar_id):
+    """Insert or update a tenant row in the Tenants tab."""
+    vals = [slug, json.dumps(company), sheet_id, calendar_id]
+    rows = _sheet_get(REGISTRY_SHEET, "Tenants!A2:A")
+    idx = next((i for i, r in enumerate(rows) if r and r[0] == slug), None)
+    if idx is not None:
+        _sheet_update(REGISTRY_SHEET, f"Tenants!A{idx + 2}:D{idx + 2}", [vals])
+    else:
+        _sheet_append(REGISTRY_SHEET, "Tenants!A:D", [vals])
+
 def provision_company(company, owner_email):
     """Create this company's own Sheet + Calendar (both usable by the owner and this SA). Returns
     {sheet_id, calendar_id, sheet_url} on success, or {error, detail}. Sheet is created first so a
