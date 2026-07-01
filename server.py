@@ -152,7 +152,7 @@ def scrape_profile(business, city, website="", phone=""):
 def verified_facts(c):
     lines = [
         f"- Business: {c['business']}",
-        f"- Service area: {c['service_area']} (based in {c['city']})",
+        f"- Service area: {c['service_area']}" + (f" (based in {c['city']})" if c.get('city') else ""),
         f"- Hours: {c['hours']}",
         f"- Services: {c['services']}",
         f"- Emergency service: {c['emergency']}",
@@ -257,7 +257,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(n) if n else b"{}"
-        data = json.loads(raw or b"{}")
+        try:
+            data = json.loads(raw or b"{}")
+        except Exception:
+            self._send(400, json.dumps({"error": "invalid json"})); return
         if self.path == "/token":
             _, tenant = get_tenant(data.get("c", ""))
             company = tenant["company"]
@@ -314,9 +317,12 @@ if __name__ == "__main__":
         print("  (could not ensure Tenants tab:", str(e)[:100], ")")
     reg = registry(force=True)
     print(f"\n  Receptionist server — default: {config.COMPANY['business']} (/?c={DEFAULT_TENANT}) + {len(reg)} provisioned")
-    with socketserver.TCPServer(("0.0.0.0", PORT), Handler) as httpd:
-        print(f"  Open:  http://localhost:{PORT}    (Ctrl+C to stop)\n")
-        try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            print("\n  stopped.")
+    # Threaded: each request runs in its own thread, so a slow /provision (web scrape + sheet/calendar
+    # creation, up to ~2 min) never blocks concurrent token mints or tool calls from live callers.
+    httpd = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    httpd.daemon_threads = True
+    print(f"  Open:  http://localhost:{PORT}    (Ctrl+C to stop)\n")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n  stopped.")

@@ -37,16 +37,17 @@ MODEL = os.environ.get("MODEL", "models/gemini-3.1-flash-live-preview")  # half-
 VOICE = os.environ.get("VOICE", "Aoede")                                  # pinned so it never changes
 PORT  = int(os.environ.get("PORT", "8765"))
 
-# --- the company this receptionist represents (owner-declared = authoritative facts) ---
+# --- default/fallback company (a NEUTRAL generic HVAC template). Real prospects each get their own
+#     provisioned tenant with a web-scraped profile, so this is only the demo shown at "/" with no ?c=. ---
 COMPANY = {
-    "business": os.environ.get("BUSINESS", "Bay Area Comfort HVAC"),
-    "city": os.environ.get("CITY", "San Jose"),
+    "business": os.environ.get("BUSINESS", "Demo HVAC Co"),
+    "city": os.environ.get("CITY", ""),
     "tz": TZ,
-    "hours": "Monday to Saturday 7am to 7pm, with 24/7 emergency service",
-    "service_area": "San Jose and the South Bay",
-    "services": "AC repair, furnace and heating service, installations, tune-ups, and emergency calls",
-    "emergency": "Yes — 24/7 emergency service for no-heat, no-cooling, and urgent breakdowns",
-    "features": "licensed and insured, free estimates, upfront quotes before any work",
+    "hours": "Monday to Saturday, 8am to 6pm",
+    "service_area": "the local area",
+    "services": "heating and cooling repair, installation, and maintenance",
+    "emergency": "Call us for urgent no-heat or no-cooling situations",
+    "features": "licensed and insured, free estimates, upfront quotes",
     "default_duration_min": 60,
     # business hours window for scheduling (24h clock, local time)
     "open_hour": 8,

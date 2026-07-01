@@ -31,7 +31,8 @@ function doPost(e) {
     var log = ss.insertSheet('Call Log');
     log.appendRow(body.log_headers || ['timestamp']);
 
-    if (body.share_with) ss.addEditor(body.share_with);  // grant the service account read/write
+    if (body.share_with)  ss.addEditor(body.share_with);   // service account: runtime read/write
+    if (body.share_owner) ss.addEditor(body.share_owner);  // human owner (realvidhaan): visibility/control
 
     return _json({ spreadsheet_id: ss.getId(), url: ss.getUrl() });
   } catch (err) {

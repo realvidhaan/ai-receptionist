@@ -194,15 +194,17 @@ def share_calendar(cid, email, role="writer"):
     return _req("POST", f"https://www.googleapis.com/calendar/v3/calendars/{urllib.parse.quote(cid)}/acl",
                 {"role": role, "scope": {"type": "user", "value": email}})
 
-def create_sheet(title):
-    """Create a Customers+Call Log spreadsheet OWNED BY THE OWNER via their Apps Script web app, which also
-    shares it with this service account for runtime read/write. Returns {spreadsheet_id, url} or {_err}.
-    (Personal-account service accounts have zero Drive storage, so they can't create the file themselves.)"""
+def create_sheet(title, share_owner=""):
+    """Create a Customers+Call Log spreadsheet via the owner's Apps Script web app (which owns the file since a
+    personal-account service account has zero Drive storage). It shares the sheet with this service account for
+    runtime read/write AND, if given, with the human owner (share_owner) so they can see it. Returns
+    {spreadsheet_id, url} or {_err}."""
     if not SHEET_CREATOR_URL:
         return {"_err": "no_creator", "_body": "SHEET_CREATOR_URL not set - deploy the sheet-creator Apps Script."}
     try:
         body = json.dumps({"secret": config.PROVISION_SECRET, "title": title,
                            "share_with": _creds.service_account_email,
+                           "share_owner": share_owner,
                            "customers_headers": HEADERS, "log_headers": LOG_HEADERS}).encode()
         req = urllib.request.Request(SHEET_CREATOR_URL, data=body, method="POST",
                                      headers={"Content-Type": "application/json"})
@@ -259,7 +261,7 @@ def provision_company(company, owner_email):
     sheet failure never leaves an orphaned calendar behind."""
     biz = company.get("business", "HVAC Company")
     tz = company.get("tz", TZ)
-    sh = create_sheet(f"{biz} - Receptionist DB")
+    sh = create_sheet(f"{biz} - Receptionist DB", share_owner=owner_email)  # sheet shared with the owner too
     if "_err" in sh:
         return {"error": "could not create sheet", "detail": sh}
     sid = sh["spreadsheet_id"]
@@ -267,7 +269,7 @@ def provision_company(company, owner_email):
     if "_err" in cal or not cal.get("id"):
         return {"error": "could not create calendar", "detail": cal, "sheet_id": sid, "sheet_url": sh.get("url")}
     cid = cal["id"]
-    share_calendar(cid, owner_email, "writer")
+    share_calendar(cid, owner_email, "owner")  # owner gets full control of the SA-owned calendar
     return {"calendar_id": cid, "sheet_id": sid, "sheet_url": sh.get("url")}
 
 # ---------- the tools ----------
