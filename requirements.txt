@@ -1,2 +1,3 @@
 certifi
 google-auth
+requests
